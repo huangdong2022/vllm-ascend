@@ -24,6 +24,6 @@ class MSAttentionMetadataSplitConfig:
     # micro batch num
     num_micro_batches: int = 2
     # split micro batches only when total tokens >= min_total_tokens_to_split
-    min_total_tokens_to_split: int = 256
+    min_total_tokens_to_split: int = 2
     # split micro batches only when prefill tokens >= min_prefill_tokens_to_split
-    min_prefill_tokens_to_split: int = 64
+    min_prefill_tokens_to_split: int = 2

@@ -48,8 +48,8 @@ class MultiStreamStepMetadata:
 @dataclass
 class MultiStreamConfig:
     """Controls the behavior of multi-stream models."""
-    min_total_tokens_to_split: int = 256
-    min_prefill_tokens_to_split: int = 64
+    min_total_tokens_to_split: int = 2
+    min_prefill_tokens_to_split: int = 2
     num_micro_batches: int = 2
     imbalance_ratio: float = 0.1
 

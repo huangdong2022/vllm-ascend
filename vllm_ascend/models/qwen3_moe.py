@@ -17,7 +17,7 @@
 # Adapted from vllm/model_executor/models/qwen3_moe.py
 # This file is a part of the vllm-ascend project.
 
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import torch
 from torch import nn
@@ -47,6 +47,8 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend.multistream.layers import MultiStreamPreTransformerLayer, MultiStreamPostTransformerLayer
+from vllm_ascend.multistream.metadata import MultiStreamConfig, make_multistream_metadata_ds
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
@@ -243,6 +245,99 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
 
         return hidden_states, residual
 
+    def forward_generator(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        _metadata_for_padding: Optional[MetadataForPadding] = None,
+        attn_metadata=None,
+        stream=None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        with torch.npu.stream(stream):
+            get_forward_context().attn_metadata = attn_metadata
+            hidden_states, residual = self._forward_comp_input_layernorm(hidden_states, residual, _metadata_for_padding)
+            yield
+        with torch.npu.stream(stream):
+            get_forward_context().attn_metadata = attn_metadata
+            hidden_states = self._forward_comp_attn(positions, hidden_states, _metadata_for_padding)
+            yield
+        with torch.npu.stream(stream):
+            get_forward_context().attn_metadata = attn_metadata
+            hidden_states, residual = self._froward_comp_post_attention_layernorm(hidden_states, residual)
+            yield
+        with torch.npu.stream(stream):
+            get_forward_context().attn_metadata = attn_metadata
+            hidden_states = self._froward_comp_mlp(hidden_states, _metadata_for_padding)
+            yield hidden_states, residual
+
+    def _forward_comp_input_layernorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        _metadata_for_padding: Optional[MetadataForPadding] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        # To prevent precision issues during the decoder phase when only prefilling enables SP
+        if not self.enable_sequence_parallelism:
+            self.self_attn.o_proj.reduce_results = True
+        else:
+            self.self_attn.o_proj.reduce_results = not _metadata_for_padding.not_dummy_and_is_prefill if _metadata_for_padding is not None else True
+
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
+                residual = _metadata_for_padding.padding_slice(residual)
+
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+
+            if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
+                hidden_states = _metadata_for_padding.allgather_unpadding_aligned(
+                    hidden_states)
+        return hidden_states, residual
+
+    def _forward_comp_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        _metadata_for_padding: Optional[MetadataForPadding] = None
+    ) -> torch.Tensor:
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
+            hidden_states = _metadata_for_padding.padding_aligned_reduce_scatter(
+                hidden_states)
+        return hidden_states
+
+    def _froward_comp_post_attention_layernorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        return hidden_states, residual
+
+    def _froward_comp_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        _metadata_for_padding: Optional[MetadataForPadding] = None
+    ) -> torch.Tensor:
+        if not self.use_aclgraph:
+            hidden_states = self.mlp(
+                hidden_states, _metadata_for_padding=_metadata_for_padding)
+        else:
+            hidden_states = self.mlp(hidden_states)
+        return hidden_states
+
 
 @support_torch_compile
 class CustomQwen3MoeModel(Qwen3MoeModel):
@@ -280,6 +375,22 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
+        
+        # 无self.first_k_dense_replace， 设置为0
+        self.first_k_dense_replace = 0
+        self.multistream_config = MultiStreamConfig()
+
+        multistream_metadata = make_multistream_metadata_ds(
+            start_layer=self.start_layer + self.first_k_dense_replace,
+            end_layer=self.end_layer,
+            causal_lm=getattr(config, "causal_lm", True),
+            multistream_config=self.multistream_config,
+        )
+        self.ms_pre_layer = MultiStreamPreTransformerLayer(
+            multistream_metadata)
+
+        self.ms_post_layer = MultiStreamPostTransformerLayer(
+            multistream_metadata)
 
     def forward(
         self,
@@ -299,20 +410,42 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        attn_metadata, [positions_split, hidden_states_split, residual_split] = \
+            self.ms_pre_layer([positions, hidden_states, residual], )
+        stream1 = torch.npu.Stream()
+        stream2 = torch.npu.Stream()
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-                _metadata_for_padding=_metadata_for_padding)
+            if len(hidden_states_split) == 2:
+                generator1 = layer.forward_generator(positions_split[0], hidden_states_split[0], residual_split[0], _metadata_for_padding,
+                                                     attn_metadata[0], stream1)
+                generator2 = layer.forward_generator(positions_split[1], hidden_states_split[1], residual_split[1], _metadata_for_padding,
+                                                     attn_metadata[1], stream2)
+                output1 = None
+                output2 = None
+                for stage1, stage2 in zip(generator1, generator2):
+                    # for _, (stage1, stage2) in enumerate(zip(generator1, generator2)):
+                    # print('[Rank {}] {} {} {}'.format(rank, i, stage1.shape, stage2.shape))
+                    output1, output2 = stage1, stage2
+            else:
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    _metadata_for_padding=_metadata_for_padding)
+
+        if len(hidden_states_split) == 2:
+            hidden_states = [output1[0], output2[0]]
+            residual = [output1[1], output2[1]]
+            [hidden_states, residual] = self.ms_post_layer([hidden_states, residual], )
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, *res = self.norm(hidden_states, residual)
 
         if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
             hidden_states = _metadata_for_padding.allgather_unpadding_aligned(
