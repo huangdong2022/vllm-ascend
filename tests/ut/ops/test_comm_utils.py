@@ -14,15 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
+import os
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from unittest.mock import patch
 
 from tests.ut.base import PytestBase
 from vllm_ascend.ops.moe.comm_utils import (
     _gather_along_first_dim, async_all_to_all,
-    gather_from_sequence_parallel_region)
+    gather_from_sequence_parallel_region, is_enable_fusion_gmm_all2allv2)
+from vllm_ascend.utils import AscendSocVersion
 
 
 class TestDistributedCommunication(PytestBase):
@@ -96,3 +99,12 @@ class TestDistributedCommunication(PytestBase):
             expected_shape = [sum(output_split_sizes)] + list(
                 input_tensor.shape[1:])
             assert result.shape == torch.Size(expected_shape)
+
+    @patch.dict(os.environ, {"HCCL_OP_EXPANSION_MODE": "AIV"})
+    def test_is_enable_fusion_gmm_all2allv2(self, mocker: MockerFixture):
+        """Test is_enable_fusion_gmm_all2allv2"""
+        mock_forward_context = mocker.patch("vllm_ascend.ops.moe.comm_utils.get_forward_context")
+        mock_forward_context.return_value.model_type = "qwen3_moe"
+        mocker.patch("vllm_ascend.ops.moe.comm_utils.get_ascend_soc_version", return_value=AscendSocVersion.A2)
+        mocker.patch("vllm_ascend.ops.moe.comm_utils.envs_ascend.VLLM_ASCEND_ENABLE_GMM_All2AllV2", return_value="1")
+        assert is_enable_fusion_gmm_all2allv2()

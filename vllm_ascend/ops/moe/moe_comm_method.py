@@ -89,7 +89,8 @@ class MoECommMethod(ABC):
             log2phy: torch.Tensor = None,
             global_redundant_expert_num: int = 0,
             need_trans: bool = False,
-            dynamic_eplb: bool = False):
+            dynamic_eplb: bool = False,
+            moe_all_to_all_group_name: str = ""):
         # Check constraints
         assert hidden_states.dtype in [
             torch.float32, torch.float16, torch.bfloat16
@@ -129,7 +130,9 @@ class MoECommMethod(ABC):
                                        with_quant=use_int8_w8a8
                                        or use_int4_w4a8,
                                        fusion=use_int8_w8a8,
-                                       need_trans=need_trans)
+                                       need_trans=need_trans,
+                                       token_dispatcher=self.token_dispatcher,
+                                       moe_all_to_all_group_name=moe_all_to_all_group_name)
 
         final_hidden_states = self.token_dispatcher.token_combine(
             hidden_states=mlp_output)

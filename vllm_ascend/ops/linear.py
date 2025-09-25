@@ -36,10 +36,9 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_ascend.distributed.parallel_state import (get_mlp_tp_group,
                                                     get_otp_group)
+from vllm_ascend.ops.comm_utils import get_hcomm_info
 from vllm_ascend.utils import (dense_optim_enable, matmul_allreduce_enable,
                                mlp_tp_enable, oproj_tp_enable)
-
-_HCOMM_INFO = None
 
 
 class AscendColumnParallelLinear(ColumnParallelLinear):
@@ -150,7 +149,7 @@ class AscendRowParallelLinear(RowParallelLinear):
         elif matmul_allreduce_enable():
             comm_group = get_tp_group()
             self.forward_type = "matmul_allreduce"
-            self.hcomm_info = self.get_hcomm_info(comm_group.device_group)
+            self.hcomm_info = get_hcomm_info(comm_group.device_group)
         elif dense_optim_enable():
             comm_group = get_tp_group()
             self.forward_type = "dense_optim"
@@ -208,22 +207,6 @@ class AscendRowParallelLinear(RowParallelLinear):
 
         if matmul_allreduce_enable():
             self.weight_t = self.weight.t()
-
-    @staticmethod
-    def get_hcomm_info(group: ProcessGroup) -> str:
-        """Get the HCCL communication information for the given group."""
-        global _HCOMM_INFO
-        if _HCOMM_INFO is not None:
-            return _HCOMM_INFO
-
-        rank = torch.distributed.get_rank(group)
-        if torch.__version__ > "2.0":
-            global_rank = torch.distributed.get_global_rank(group, rank)
-            _HCOMM_INFO = group._get_backend(
-                torch.device("npu")).get_hccl_comm_name(global_rank)
-        else:
-            _HCOMM_INFO = group.get_hccl_comm_name(rank)
-        return _HCOMM_INFO
 
     def forward(
         self,

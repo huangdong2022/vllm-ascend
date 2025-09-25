@@ -230,7 +230,8 @@ class AscendW8A8DynamicFusedMoEMethod:
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 expert_map=expert_map,
-                dynamic_eplb=self.dynamic_eplb)
+                dynamic_eplb=self.dynamic_eplb,
+                moe_all_to_all_group_name=self.moe_all_to_all_group_name)
 
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
@@ -257,7 +258,8 @@ class AscendW8A8DynamicFusedMoEMethod:
             shared_experts=shared_experts,
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,
-            dynamic_eplb=self.dynamic_eplb)
+            dynamic_eplb=self.dynamic_eplb,
+            moe_all_to_all_group_name=self.moe_all_to_all_group_name)
 
     def process_weights_after_loading(self, layer):
         if self.transpose_weight:

@@ -421,7 +421,8 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.assertIsNotNone(result["group_list"])
         self.assertEqual(result["group_list_type"], 1)
 
-    def test_token_combine(self):
+    @patch("vllm_ascend.ops.moe.token_dispatcher.is_enable_fusion_gmm_all2all")
+    def test_token_combine(self, mock_enable_fusion_gmm_all2all):
         self.dispatcher.hidden_shape = (8, 16)
         self.dispatcher.hidden_shape_before_permute = (8, 16)
         self.dispatcher.reversed_local_input_permutation_mapping = torch.arange(
@@ -439,6 +440,7 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
             [[2, 2], [2, 2]], dtype=torch.int64)
 
         expert_output = torch.randn(16, 16)
+        mock_enable_fusion_gmm_all2all.return_value = False
         output = self.dispatcher.token_combine(expert_output)
 
         self.assertIsNotNone(output)

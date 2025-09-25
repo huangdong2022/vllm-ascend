@@ -19,8 +19,11 @@ from typing import Optional
 import torch
 import torch_npu
 from torch.nn.functional import pad
+from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context
 
+from vllm_ascend.ops.moe.comm_utils import is_enable_fusion_gmm_all2allv2, trans_scale_from_float_to_int64
+from vllm_ascend.ops.moe.token_dispatcher import MoETokenDispatcher, TokenDispatcherWithAll2AllV
 from vllm_ascend.utils import dispose_tensor, is_310p
 
 
@@ -62,7 +65,9 @@ def quant_apply_mlp(hidden_states: torch.Tensor,
                     dynamic_scale: torch.Tensor = None,
                     w1_scale_bias: torch.Tensor = None,
                     w2_scale_bias: torch.Tensor = None,
-                    fusion: bool = False) -> torch.Tensor:
+                    fusion: bool = False,
+                    token_dispatcher: MoETokenDispatcher = None,
+                    moe_all_to_all_group_name: str = "") -> torch.Tensor:
     if dynamic_scale is None:
         unquantized_hidden_states = hidden_states
         hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(
@@ -160,17 +165,38 @@ def quant_apply_mlp(hidden_states: torch.Tensor,
             hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(
                 hidden_states)
         # gmm2: down_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[w2],
-            scale=[w2_scale],
-            bias=bias2,
-            per_token_scale=[swiglu_out_scale],
-            split_item=2,
-            group_list_type=group_list_type,
-            group_type=0,
-            group_list=group_list,
-            output_dtype=_output_dtype)[0]
+        if is_enable_fusion_gmm_all2allv2() and isinstance(token_dispatcher, TokenDispatcherWithAll2AllV):
+            ep_size = get_forward_context().ep_size
+            global_token_per_expert = token_dispatcher.num_global_tokens_per_expert
+            # gmm_weight_scale only support DT_INT64
+            w2_scale_quant = trans_scale_from_float_to_int64(w2_scale)
+            # aicpu mode invoke aclnnGroupedMatMulAlltoAllvV1, aiv mode invoke aclnnGroupedMatMulAlltoAllvV2
+            hidden_states = torch_npu.npu_gmm_alltoallv(
+                gmm_x=hidden_states,
+                gmm_weight=w2,
+                hcom=moe_all_to_all_group_name,
+                ep_world_size=ep_size,
+                trans_gmm_weight=False,
+                global_token_per_expert=global_token_per_expert,
+                gmm_weight_scale=w2_scale_quant,
+                gmm_x_scale=swiglu_out_scale,
+                comm_mode="aiv",      # A2 support aiv, A5 support aicpu, A3 support aiv/aicpu
+                y_dtype=0,            # quant mode only support fp16, 0-fp16, 1-bf16
+                output_token_num=group_list.sum())[0]
+            # trans output dtype to original requirement
+            hidden_states = hidden_states.to(_output_dtype)
+        else:
+            hidden_states = torch_npu.npu_grouped_matmul(
+                x=[hidden_states],
+                weight=[w2],
+                scale=[w2_scale],
+                bias=bias2,
+                per_token_scale=[swiglu_out_scale],
+                split_item=2,
+                group_list_type=group_list_type,
+                group_type=0,
+                group_list=group_list,
+                output_dtype=_output_dtype)[0]
 
     return hidden_states
 
@@ -228,7 +254,9 @@ def unified_apply_mlp(hidden_states: torch.Tensor,
                       topk_scales: Optional[torch.Tensor] = None,
                       with_quant: bool = False,
                       fusion: bool = False,
-                      need_trans: bool = True) -> torch.Tensor:
+                      need_trans: bool = True,
+                      token_dispatcher: MoETokenDispatcher = None,
+                      moe_all_to_all_group_name: str = "") -> torch.Tensor:
     if with_quant:
         return quant_apply_mlp(hidden_states=hidden_states,
                                w1=w1,
@@ -240,7 +268,9 @@ def unified_apply_mlp(hidden_states: torch.Tensor,
                                group_list_type=group_list_type,
                                w1_scale_bias=w1_scale_bias,
                                w2_scale_bias=w2_scale_bias,
-                               fusion=fusion)
+                               fusion=fusion,
+                               token_dispatcher=token_dispatcher,
+                               moe_all_to_all_group_name=moe_all_to_all_group_name)
     else:
         return unquant_apply_mlp(hidden_states=hidden_states,
                                  w1=w1,

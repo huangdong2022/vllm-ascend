@@ -85,7 +85,8 @@ def set_ascend_forward_context(
                                                is_deepseek_v3_r1)
         forward_context.fused_moe_state = fused_moe_state
         forward_context.in_profile_run = in_profile_run
-
+        forward_context.model_type = vllm_config.model_config.hf_config.model_type
+        forward_context.ep_size = ep_size
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
         forward_context.capturing = False

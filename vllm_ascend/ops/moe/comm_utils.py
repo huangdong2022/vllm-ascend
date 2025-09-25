@@ -15,10 +15,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
+
+import numpy as np
 import torch
 import torch.distributed
 import torch.distributed as dist
 import torch_npu
+
+from vllm.forward_context import get_forward_context
+
+import vllm_ascend.envs as envs_ascend
+from vllm_ascend.utils import get_ascend_soc_version, AscendSocVersion
 
 COMM_STREAM = None
 
@@ -111,3 +119,23 @@ def gather_from_sequence_parallel_region(
 ):
     """Wrapper for autograd function: forward: AG, backward: RS <first dim>"""
     return _gather_along_first_dim(input_, group, output_split_sizes)
+
+
+def is_enable_fusion_gmm_all2allv2() -> bool:
+    """check if gmmall2allv2 operation is enabled"""
+    model_type = get_forward_context().model_type
+    soc_info = get_ascend_soc_version()
+    hccl_op_expansion_mode = os.getenv("HCCL_OP_EXPANSION_MODE")
+    return (envs_ascend.VLLM_ASCEND_ENABLE_GMM_All2AllV2
+            and "qwen3_moe" == model_type
+            and soc_info in [AscendSocVersion.A2, AscendSocVersion.A3]
+            and hccl_op_expansion_mode == 'AIV')
+
+
+def trans_scale_from_float_to_int64(scale):
+    """trans scale dtype from fp16/bf16 to int64, used for fusion op such as gmmall2allv"""
+    original_shape = scale.shape
+    scale = torch.from_numpy(np.frombuffer(scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32)
+                             .reshape(original_shape)
+                             .astype(np.int64)).to(scale.device)
+    return scale

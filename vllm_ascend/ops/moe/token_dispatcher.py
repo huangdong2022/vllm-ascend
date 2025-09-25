@@ -30,7 +30,7 @@ from vllm.distributed.parallel_state import get_ep_group
 
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.moe.comm_utils import (
-    async_all_to_all, gather_from_sequence_parallel_region)
+    async_all_to_all, gather_from_sequence_parallel_region, is_enable_fusion_gmm_all2allv2)
 from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
 
 
@@ -563,15 +563,17 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                       bias: torch.Tensor = None):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
 
-        hidden_states = self._combine_preprocess(hidden_states)
+        permutated_local_input_tokens = hidden_states
+        if not is_enable_fusion_gmm_all2allv2():
+            hidden_states = self._combine_preprocess(hidden_states)
 
-        # Perform expert parallel AlltoAll communication
-        # hidden_states: [SEQL, H] -> [SEQL, H/TP]
-        _, permutated_local_input_tokens, handle = async_all_to_all(
-            hidden_states, self.input_splits, self.output_splits,
-            self.ep_group)
-        handle.wait()
-        hidden_states.untyped_storage().resize_(0)
+            # Perform expert parallel AlltoAll communication
+            # hidden_states: [SEQL, H] -> [SEQL, H/TP]
+            _, permutated_local_input_tokens, handle = async_all_to_all(
+                hidden_states, self.input_splits, self.output_splits,
+                self.ep_group)
+            handle.wait()
+            hidden_states.untyped_storage().resize_(0)
 
         output = self._combine_postprocess(permutated_local_input_tokens)
 
@@ -613,10 +615,10 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
             ep_size,
             self.num_local_experts).sum(axis=1).to(torch.device("cpu"),
                                                    non_blocking=True).numpy())
-        num_global_tokens_per_expert = gather_from_sequence_parallel_region(
+        self.num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert,
             group=self.ep_group).reshape(ep_size, self.num_experts)
-        self.num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, self.local_expert_indices[
+        self.num_global_tokens_per_local_expert = self.num_global_tokens_per_expert[:, self.local_expert_indices[
             0]:self.local_expert_indices[-1] + 1]
         if self.num_global_tokens_per_local_expert is None:
             raise ValueError(
