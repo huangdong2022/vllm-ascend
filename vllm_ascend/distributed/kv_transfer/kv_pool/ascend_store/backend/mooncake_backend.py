@@ -18,6 +18,7 @@ from vllm.utils.network_utils import get_ip
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.parallel_state import get_global_rank
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
@@ -109,9 +110,10 @@ class MooncakeBackend(Backend):
         # each other. Include the DP rank in the sub-path to keep each (dp, tp)
         # rank isolated.
         if ssd_kwargs and ssd_kwargs.get("ssd_offload_path"):
-            local_rank = get_world_group().local_rank
-            dp_rank = get_dp_group().rank_in_group
-            rank_path = os.path.join(str(ssd_kwargs["ssd_offload_path"]), f"dp{dp_rank}_tp{local_rank}")
+            # Per-rank SSD directory keyed by the globally unique rank so that
+            # DP/TP/PP/CP replicas never share a directory (dense and MoE alike).
+            global_rank = get_global_rank()
+            rank_path = os.path.join(str(ssd_kwargs["ssd_offload_path"]), f"rank_{global_rank}")
             try:
                 os.makedirs(rank_path, exist_ok=True)
             except OSError as e:
